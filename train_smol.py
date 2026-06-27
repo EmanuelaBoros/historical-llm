@@ -91,16 +91,6 @@ def get_hf_token() -> str:
 def clean_text(example: dict) -> dict:
     """
     Convert one dataset example into a training text.
-
-    For PleIAs/French-PD-Newspapers, the useful column is usually:
-        complete_text
-
-    We:
-    - read the text column
-    - normalize whitespace
-    - remove too-short documents
-    - truncate very long documents
-    - wrap the document with simple control tokens
     """
     text = example.get(CFG.text_column)
 
