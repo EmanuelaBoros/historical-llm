@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -40,12 +39,6 @@ def year_to_period_id(year: int) -> int:
 
 
 class TemporalAdapter(nn.Module):
-    """
-    Small parameter-efficient adapter.
-
-    This is the 'Horizon Adapter' from your figure, simplified.
-    """
-
     def __init__(
         self,
         hidden_size: int,
@@ -59,29 +52,17 @@ class TemporalAdapter(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.up = nn.Linear(bottleneck_size, hidden_size)
 
-        # Important: start close to identity behavior
+        # Start close to identity
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        residual = hidden_states
-
-        x = self.down(hidden_states)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.up(x)
-
-        return residual + x
+        return hidden_states + self.up(
+            self.dropout(self.activation(self.down(hidden_states)))
+        )
 
 
 class TemporalAdapterBank(nn.Module):
-    """
-    One adapter per time period.
-
-    period_ids shape: [batch]
-    hidden_states shape: [batch, seq_len, hidden]
-    """
-
     def __init__(
         self,
         hidden_size: int,
@@ -112,11 +93,8 @@ class TemporalAdapterBank(nn.Module):
         period_ids: [batch]
         """
 
-        if hidden_states.dim() != 3:
-            raise ValueError(
-                f"Expected hidden_states to have shape [batch, seq_len, hidden], "
-                f"but got {tuple(hidden_states.shape)}"
-            )
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
 
         if period_ids.dim() == 0:
             period_ids = period_ids.unsqueeze(0)
@@ -138,31 +116,26 @@ class TemporalAdapterBank(nn.Module):
             mask = period_ids == period_id
 
             if mask.any():
-                selected = hidden_states[mask, :, :]
-                output[mask, :, :] = adapter(selected)
+                output[mask, :, :] = adapter(hidden_states[mask, :, :])
 
         return output
 
 
 # ---------------------------------------------------------------------
-# Long-horizon historical BERT
+# Historical Temporal BERT
 # ---------------------------------------------------------------------
 
 
 class HistoricalTemporalBertForMLM(nn.Module):
     """
-    BERT MLM model with temporal adapters.
+    Simpler stable version:
 
-    Backbone:
-        AutoModelForMaskedLM
+    input
+      -> BERT encoder
+      -> temporal adapter selected by document period
+      -> MLM head
 
-    Extra:
-        one temporal adapter bank after each BERT encoder layer.
-
-    This is a practical implementation of:
-        A. Horizon adapters
-        B. Long-horizon transformer backbone
-        E. MLM task head
+    This avoids manually looping over BERT layers.
     """
 
     def __init__(
@@ -176,20 +149,13 @@ class HistoricalTemporalBertForMLM(nn.Module):
 
         self.base = AutoModelForMaskedLM.from_pretrained(base_model_name)
 
-        config = self.base.config
-        hidden_size = config.hidden_size
-        num_layers = config.num_hidden_layers
+        hidden_size = self.base.config.hidden_size
 
-        self.temporal_adapters = nn.ModuleList(
-            [
-                TemporalAdapterBank(
-                    hidden_size=hidden_size,
-                    num_periods=num_periods,
-                    bottleneck_size=adapter_bottleneck_size,
-                    dropout=adapter_dropout,
-                )
-                for _ in range(num_layers)
-            ]
+        self.temporal_adapter_bank = TemporalAdapterBank(
+            hidden_size=hidden_size,
+            num_periods=num_periods,
+            bottleneck_size=adapter_bottleneck_size,
+            dropout=adapter_dropout,
         )
 
         self.num_periods = num_periods
@@ -212,43 +178,46 @@ class HistoricalTemporalBertForMLM(nn.Module):
         period_ids: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
     ) -> MaskedLMOutput:
+
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        if attention_mask is not None and attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
+        if labels is not None and labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+
+        batch_size = input_ids.shape[0]
+
         if period_ids is None:
-            # Default to general / first period if not provided
             period_ids = torch.zeros(
-                input_ids.shape[0],
+                batch_size,
                 dtype=torch.long,
                 device=input_ids.device,
             )
 
-        bert = self.base.bert
+        if period_ids.dim() == 0:
+            period_ids = period_ids.unsqueeze(0)
 
-        extended_attention_mask = bert.get_extended_attention_mask(
-            attention_mask,
-            input_ids.shape,
-        )
+        period_ids = period_ids.to(input_ids.device).long()
 
-        embedding_output = bert.embeddings(
+        # Official BERT forward pass
+        bert_outputs = self.base.bert(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             token_type_ids=token_type_ids,
+            return_dict=True,
         )
 
-        hidden_states = embedding_output
+        sequence_output = bert_outputs.last_hidden_state
 
-        for i, layer_module in enumerate(bert.encoder.layer):
-            layer_outputs = layer_module(
-                hidden_states,
-                attention_mask=extended_attention_mask,
-            )
+        # Apply temporal adapter after BERT encoder
+        sequence_output = self.temporal_adapter_bank(
+            hidden_states=sequence_output,
+            period_ids=period_ids,
+        )
 
-            hidden_states = layer_outputs[0]
-
-            # Temporal adapter injection
-            hidden_states = self.temporal_adapters[i](
-                hidden_states=hidden_states,
-                period_ids=period_ids,
-            )
-
-        sequence_output = hidden_states
         prediction_scores = self.base.cls(sequence_output)
 
         loss = None
