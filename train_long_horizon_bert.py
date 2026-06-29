@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from dataclasses import dataclass
 
 import torch
 from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
+from huggingface_hub import HfApi
+from transformers import AutoTokenizer, Trainer, TrainingArguments
 
 from collator_temporal_mlm import TemporalDataCollatorForMLM
 from modeling_temporal_bert import (
@@ -18,63 +16,43 @@ from modeling_temporal_bert import (
     year_to_period_id,
 )
 
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-
 
 @dataclass
 class Config:
-    # Model
     base_model: str
-
-    # Dataset
     dataset_name: str
     dataset_split: str
     text_column: str
     date_column: str
     ocr_column: str
 
-    # Output
     output_dir: str
     output_repo: str
     push_to_hub: bool
 
-    # Training size
     max_seq_length: int
     max_train_examples: int
     max_eval_examples: int
     max_steps: int
 
-    # Optimization
     batch_size: int
     eval_batch_size: int
     grad_accum: int
     learning_rate: float
     warmup_steps: int
 
-    # MLM
     mlm_probability: float
 
-    # Adapter
     adapter_bottleneck_size: int
     adapter_dropout: float
 
-    # Text filtering
     min_chars: int
     max_chars: int
     min_ocr: int | None
-
-    # Optional temporal filtering
     start_year: int | None
     end_year: int | None
 
-    # Logging / saving
     logging_steps: int
-    eval_steps: int
-    save_steps: int
-
-    # Debug
     check_batch: bool
 
 
@@ -101,10 +79,9 @@ def optional_int(value: str | None) -> int | None:
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(
-        description="Train a long-horizon historical BERT with temporal adapters."
+        description="Train long-horizon historical BERT with temporal adapters."
     )
 
-    # Model
     parser.add_argument(
         "--base_model",
         default=os.environ.get(
@@ -113,7 +90,6 @@ def parse_args() -> Config:
         ),
     )
 
-    # Dataset
     parser.add_argument(
         "--dataset_name",
         default=os.environ.get(
@@ -138,13 +114,9 @@ def parse_args() -> Config:
         default=os.environ.get("OCR_COLUMN", "ocr"),
     )
 
-    # Output
     parser.add_argument(
         "--output_dir",
-        default=os.environ.get(
-            "OUTPUT_DIR",
-            "long-horizon-historical-bert",
-        ),
+        default=os.environ.get("OUTPUT_DIR", "long-horizon-historical-bert"),
     )
     parser.add_argument(
         "--output_repo",
@@ -159,7 +131,6 @@ def parse_args() -> Config:
         default=str2bool(os.environ.get("PUSH_TO_HUB", "true")),
     )
 
-    # Training size
     parser.add_argument(
         "--max_seq_length",
         type=int,
@@ -173,7 +144,7 @@ def parse_args() -> Config:
     parser.add_argument(
         "--max_eval_examples",
         type=int,
-        default=int(os.environ.get("MAX_EVAL_EXAMPLES", "2000")),
+        default=int(os.environ.get("MAX_EVAL_EXAMPLES", "100")),
     )
     parser.add_argument(
         "--max_steps",
@@ -181,16 +152,15 @@ def parse_args() -> Config:
         default=int(os.environ.get("MAX_STEPS", "3000")),
     )
 
-    # Optimization
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=int(os.environ.get("BATCH_SIZE", "8")),
+        default=int(os.environ.get("BATCH_SIZE", "4")),
     )
     parser.add_argument(
         "--eval_batch_size",
         type=int,
-        default=int(os.environ.get("EVAL_BATCH_SIZE", "8")),
+        default=int(os.environ.get("EVAL_BATCH_SIZE", "1")),
     )
     parser.add_argument(
         "--grad_accum",
@@ -209,14 +179,12 @@ def parse_args() -> Config:
         default=int(os.environ.get("WARMUP_STEPS", "200")),
     )
 
-    # MLM
     parser.add_argument(
         "--mlm_probability",
         type=float,
         default=float(os.environ.get("MLM_PROBABILITY", "0.15")),
     )
 
-    # Adapter
     parser.add_argument(
         "--adapter_bottleneck_size",
         "--adapter_bottleneck",
@@ -229,7 +197,6 @@ def parse_args() -> Config:
         default=float(os.environ.get("ADAPTER_DROPOUT", "0.1")),
     )
 
-    # Text filtering
     parser.add_argument(
         "--min_chars",
         type=int,
@@ -245,8 +212,6 @@ def parse_args() -> Config:
         type=optional_int,
         default=optional_int(os.environ.get("MIN_OCR")),
     )
-
-    # Temporal filtering
     parser.add_argument(
         "--start_year",
         type=optional_int,
@@ -258,24 +223,11 @@ def parse_args() -> Config:
         default=optional_int(os.environ.get("END_YEAR")),
     )
 
-    # Logging / saving
     parser.add_argument(
         "--logging_steps",
         type=int,
         default=int(os.environ.get("LOGGING_STEPS", "20")),
     )
-    parser.add_argument(
-        "--eval_steps",
-        type=int,
-        default=int(os.environ.get("EVAL_STEPS", "500")),
-    )
-    parser.add_argument(
-        "--save_steps",
-        type=int,
-        default=int(os.environ.get("SAVE_STEPS", "500")),
-    )
-
-    # Debug
     parser.add_argument(
         "--check_batch",
         type=str2bool,
@@ -283,16 +235,10 @@ def parse_args() -> Config:
     )
 
     args = parser.parse_args()
-
     return Config(**vars(args))
 
 
 CFG = parse_args()
-
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
 
 
 def get_hf_token() -> str:
@@ -386,9 +332,58 @@ def print_config() -> None:
     print("=====================================================\n")
 
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
+def save_model_manually(model, tokenizer, token: str) -> None:
+    print("Saving model manually as pytorch_model.bin...")
+
+    os.makedirs(CFG.output_dir, exist_ok=True)
+
+    # Important: do NOT use safetensors here because BERT MLM has tied weights.
+    torch.save(
+        model.state_dict(),
+        os.path.join(CFG.output_dir, "pytorch_model.bin"),
+    )
+
+    model.base.config.save_pretrained(CFG.output_dir)
+    tokenizer.save_pretrained(CFG.output_dir)
+
+    # Save custom code files into the model repo.
+    for filename in [
+        "modeling_temporal_bert.py",
+        "collator_temporal_mlm.py",
+        "train_long_horizon_bert.py",
+    ]:
+        if os.path.exists(filename):
+            shutil.copy(filename, os.path.join(CFG.output_dir, filename))
+
+    # Minimal README
+    readme_path = os.path.join(CFG.output_dir, "README.md")
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(
+            "# Long-Horizon Historical BERT\n\n"
+            "BERT masked-language model with temporal adapters for French historical newspapers.\n\n"
+            "Base model: `dbmdz/bert-base-french-europeana-cased`\n\n"
+            "This repository contains a custom PyTorch model. Load with the accompanying "
+            "`modeling_temporal_bert.py` file.\n"
+        )
+
+    if CFG.push_to_hub:
+        print(f"Uploading folder to Hugging Face Hub: {CFG.output_repo}")
+
+        api = HfApi(token=token)
+        api.create_repo(
+            repo_id=CFG.output_repo,
+            repo_type="model",
+            exist_ok=True,
+        )
+        api.upload_folder(
+            repo_id=CFG.output_repo,
+            folder_path=CFG.output_dir,
+            repo_type="model",
+        )
+
+        print(f"Done. Model pushed to: {CFG.output_repo}")
+    else:
+        print(f"Done. Model saved locally to: {CFG.output_dir}")
 
 
 def main() -> None:
@@ -476,22 +471,29 @@ def main() -> None:
 
     training_args = TrainingArguments(
         output_dir=CFG.output_dir,
+
         max_steps=CFG.max_steps,
         per_device_train_batch_size=CFG.batch_size,
         per_device_eval_batch_size=CFG.eval_batch_size,
         gradient_accumulation_steps=CFG.grad_accum,
+
         learning_rate=CFG.learning_rate,
         warmup_steps=CFG.warmup_steps,
         logging_steps=CFG.logging_steps,
+
+        # Critical: no eval and no checkpoint save during Trainer training.
+        # Otherwise Trainer tries to save with safetensors and crashes on tied BERT weights.
         eval_strategy="no",
-        save_steps=CFG.save_steps,
-        save_total_limit=2,
+        save_strategy="no",
+
         fp16=torch.cuda.is_available(),
         report_to="none",
-        push_to_hub=CFG.push_to_hub,
-        hub_model_id=CFG.output_repo if CFG.push_to_hub else None,
-        hub_token=token if CFG.push_to_hub else None,
+
+        # Critical: do not let Trainer push/save.
+        push_to_hub=False,
+
         remove_unused_columns=False,
+        prediction_loss_only=True,
     )
 
     trainer = Trainer(
@@ -505,7 +507,6 @@ def main() -> None:
 
     if CFG.check_batch:
         print("Checking one batch...")
-
         batch = next(iter(trainer.get_train_dataloader()))
 
         for key, value in batch.items():
@@ -519,18 +520,7 @@ def main() -> None:
     print("Starting long-horizon temporal adapter training...")
     trainer.train()
 
-    print("Saving model locally...")
-    trainer.save_model(CFG.output_dir)
-    tokenizer.save_pretrained(CFG.output_dir)
-
-    if CFG.push_to_hub:
-        print("Pushing model and tokenizer to the Hub...")
-        model.base.config.save_pretrained(CFG.output_dir)
-        trainer.push_to_hub()
-        tokenizer.push_to_hub(CFG.output_repo, token=token)
-        print(f"Done. Model pushed to: {CFG.output_repo}")
-    else:
-        print(f"Done. Model saved locally to: {CFG.output_dir}")
+    save_model_manually(model=model, tokenizer=tokenizer, token=token)
 
 
 if __name__ == "__main__":

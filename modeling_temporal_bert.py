@@ -7,10 +7,6 @@ import torch.nn as nn
 from transformers import AutoModelForMaskedLM
 from transformers.modeling_outputs import MaskedLMOutput
 
-# ---------------------------------------------------------------------
-# Period mapping
-# ---------------------------------------------------------------------
-
 
 PERIODS = [
     "pre_1850",
@@ -33,11 +29,6 @@ def year_to_period_id(year: int) -> int:
     return 4
 
 
-# ---------------------------------------------------------------------
-# Temporal adapter
-# ---------------------------------------------------------------------
-
-
 class TemporalAdapter(nn.Module):
     def __init__(
         self,
@@ -52,13 +43,17 @@ class TemporalAdapter(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.up = nn.Linear(bottleneck_size, hidden_size)
 
-        # Start close to identity
+        # Start as almost identity
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states + self.up(
-            self.dropout(self.activation(self.down(hidden_states)))
+            self.dropout(
+                self.activation(
+                    self.down(hidden_states)
+                )
+            )
         )
 
 
@@ -88,11 +83,6 @@ class TemporalAdapterBank(nn.Module):
         hidden_states: torch.Tensor,
         period_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        hidden_states: [batch, seq_len, hidden]
-        period_ids: [batch]
-        """
-
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(0)
 
@@ -121,21 +111,14 @@ class TemporalAdapterBank(nn.Module):
         return output
 
 
-# ---------------------------------------------------------------------
-# Historical Temporal BERT
-# ---------------------------------------------------------------------
-
-
 class HistoricalTemporalBertForMLM(nn.Module):
     """
-    Simpler stable version:
+    Stable version:
 
     input
       -> BERT encoder
-      -> temporal adapter selected by document period
+      -> temporal adapter selected by document date
       -> MLM head
-
-    This avoids manually looping over BERT layers.
     """
 
     def __init__(
@@ -148,7 +131,6 @@ class HistoricalTemporalBertForMLM(nn.Module):
         super().__init__()
 
         self.base = AutoModelForMaskedLM.from_pretrained(base_model_name)
-
         hidden_size = self.base.config.hidden_size
 
         self.temporal_adapter_bank = TemporalAdapterBank(
@@ -202,7 +184,6 @@ class HistoricalTemporalBertForMLM(nn.Module):
 
         period_ids = period_ids.to(input_ids.device).long()
 
-        # Official BERT forward pass
         bert_outputs = self.base.bert(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -212,7 +193,6 @@ class HistoricalTemporalBertForMLM(nn.Module):
 
         sequence_output = bert_outputs.last_hidden_state
 
-        # Apply temporal adapter after BERT encoder
         sequence_output = self.temporal_adapter_bank(
             hidden_states=sequence_output,
             period_ids=period_ids,
