@@ -4,12 +4,11 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file as load_safetensors
+from huggingface_hub import snapshot_download
 from seqeval.metrics import (
     classification_report,
     f1_score,
@@ -18,6 +17,8 @@ from seqeval.metrics import (
 )
 from torch.utils.data import Dataset
 from transformers import (
+    AutoConfig,
+    AutoModel,
     AutoModelForTokenClassification,
     AutoTokenizer,
     DataCollatorForTokenClassification,
@@ -25,20 +26,16 @@ from transformers import (
     TrainingArguments,
 )
 
-from modeling_temporal_bert import (
-    HistoricalTemporalBertForMLM,
-    year_to_period_id,
-)
+from modeling_temporal_bert import TemporalAdapterBank, PERIODS, year_to_period_id
 
 # ---------------------------------------------------------------------
-# HIPE TSV reader
+# HIPE reader
 # ---------------------------------------------------------------------
 
 
 def parse_year(date_value: str | None) -> int | None:
     if not date_value:
         return None
-
     try:
         return int(str(date_value)[:4])
     except ValueError:
@@ -46,20 +43,6 @@ def parse_year(date_value: str | None) -> int | None:
 
 
 def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
-    """
-    Reads HIPE-style TSV files.
-
-    Returns one example per sentence:
-
-    {
-        "tokens": [...],
-        "labels": [...],
-        "date": "1790-01-02",
-        "period_id": int,
-        "document_id": str,
-    }
-    """
-
     examples = []
 
     current_tokens = []
@@ -112,9 +95,6 @@ def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
             if parts[0] == "TOKEN":
                 header = parts
 
-                if "TOKEN" not in header:
-                    raise ValueError(f"TOKEN column not found in {path}")
-
                 if label_column not in header:
                     raise ValueError(
                         f"Column {label_column} not found in {path}. "
@@ -141,7 +121,6 @@ def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
             current_labels.append(label)
 
     flush_sentence()
-
     return examples
 
 
@@ -157,8 +136,8 @@ class HipeNERDataset(Dataset):
         tokenizer,
         label2id: dict[str, int],
         max_length: int = 256,
-        label_all_tokens: bool = False,
         include_period_ids: bool = False,
+        label_all_tokens: bool = False,
     ):
         self.features = []
 
@@ -201,11 +180,6 @@ class HipeNERDataset(Dataset):
         return self.features[idx]
 
 
-# ---------------------------------------------------------------------
-# Collators
-# ---------------------------------------------------------------------
-
-
 @dataclass
 class TemporalTokenClassificationCollator:
     tokenizer: object
@@ -232,85 +206,129 @@ class TemporalTokenClassificationCollator:
 
 
 # ---------------------------------------------------------------------
-# Temporal BERT NER model
+# Temporal BERT for NER
 # ---------------------------------------------------------------------
 
 
-class HistoricalTemporalBertForTokenClassification(nn.Module):
-    """
-    Temporal BERT for NER.
-
-    Reuses:
-    - BERT encoder
-    - temporal adapter bank
-
-    Replaces:
-    - MLM head with token classification head
-    """
-
+class TemporalBertForTokenClassification(nn.Module):
     def __init__(
         self,
         base_model: str,
+        temporal_model_id: str,
         num_labels: int,
         id2label: dict[int, str],
         label2id: dict[str, int],
         adapter_bottleneck_size: int = 64,
         adapter_dropout: float = 0.1,
-        temporal_mlm_checkpoint: Optional[str] = None,
+        freeze_base: bool = False,
+        token: str | None = None,
     ):
         super().__init__()
 
-        self.temporal_mlm = HistoricalTemporalBertForMLM(
-            base_model_name=base_model,
-            adapter_bottleneck_size=adapter_bottleneck_size,
-            adapter_dropout=adapter_dropout,
+        self.config = AutoConfig.from_pretrained(base_model, token=token)
+        self.config.num_labels = num_labels
+        self.config.id2label = id2label
+        self.config.label2id = label2id
+
+        self.bert = AutoModel.from_pretrained(base_model, token=token)
+
+        self.temporal_adapter_bank = TemporalAdapterBank(
+            hidden_size=self.config.hidden_size,
+            num_periods=len(PERIODS),
+            bottleneck_size=adapter_bottleneck_size,
+            dropout=adapter_dropout,
         )
-
-        if temporal_mlm_checkpoint is not None:
-            self._load_temporal_checkpoint(temporal_mlm_checkpoint)
-
-        hidden_size = self.temporal_mlm.config.hidden_size
 
         self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(hidden_size, num_labels)
-
+        self.classifier = nn.Linear(self.config.hidden_size, num_labels)
         self.num_labels = num_labels
-        self.temporal_mlm.config.num_labels = num_labels
-        self.temporal_mlm.config.id2label = id2label
-        self.temporal_mlm.config.label2id = label2id
 
-    @property
-    def config(self):
-        return self.temporal_mlm.config
-
-    def _load_temporal_checkpoint(self, checkpoint_path: str) -> None:
-        path = Path(checkpoint_path)
-
-        if path.is_dir():
-            safetensors_path = path / "model.safetensors"
-            bin_path = path / "pytorch_model.bin"
-
-            if safetensors_path.exists():
-                state_dict = load_safetensors(str(safetensors_path))
-            elif bin_path.exists():
-                state_dict = torch.load(str(bin_path), map_location="cpu")
-            else:
-                print(f"No model weights found in {checkpoint_path}. Using base init.")
-                return
-        else:
-            if str(path).endswith(".safetensors"):
-                state_dict = load_safetensors(str(path))
-            else:
-                state_dict = torch.load(str(path), map_location="cpu")
-
-        missing, unexpected = self.temporal_mlm.load_state_dict(
-            state_dict,
-            strict=False,
+        self._load_temporal_weights(
+            temporal_model_id=temporal_model_id,
+            token=token,
         )
 
-        print(f"Loaded temporal MLM checkpoint: {checkpoint_path}")
-        print(f"Missing keys: {len(missing)}")
-        print(f"Unexpected keys: {len(unexpected)}")
+        if freeze_base:
+            for param in self.bert.parameters():
+                param.requires_grad = False
+
+    def _load_temporal_weights(self, temporal_model_id: str, token: str | None = None):
+        print(f"Downloading/loading temporal model: {temporal_model_id}")
+
+        local_dir = snapshot_download(
+            repo_id=temporal_model_id,
+            token=token,
+        )
+
+        local_dir = Path(local_dir)
+
+        adapter_path = local_dir / "temporal_adapter_bank.bin"
+        full_bin_path = local_dir / "pytorch_model.bin"
+
+        if adapter_path.exists():
+            print(f"Loading adapter-only weights from {adapter_path}")
+            adapter_state = torch.load(adapter_path, map_location="cpu")
+            missing, unexpected = self.temporal_adapter_bank.load_state_dict(
+                adapter_state,
+                strict=False,
+            )
+            print(f"Adapter missing keys: {len(missing)}")
+            print(f"Adapter unexpected keys: {len(unexpected)}")
+            return
+
+        if full_bin_path.exists():
+            print(f"Loading full temporal checkpoint from {full_bin_path}")
+            state = torch.load(full_bin_path, map_location="cpu")
+
+            # Load adapted BERT encoder if it exists.
+            bert_state = {}
+            for key, value in state.items():
+                if key.startswith("base.bert."):
+                    bert_state[key.replace("base.bert.", "")] = value
+
+            if bert_state:
+                missing, unexpected = self.bert.load_state_dict(
+                    bert_state,
+                    strict=False,
+                )
+                print(f"BERT missing keys: {len(missing)}")
+                print(f"BERT unexpected keys: {len(unexpected)}")
+
+            # Load temporal adapter bank.
+            adapter_state = {}
+            for key, value in state.items():
+                if key.startswith("temporal_adapter_bank."):
+                    adapter_state[key.replace("temporal_adapter_bank.", "")] = value
+
+            if adapter_state:
+                missing, unexpected = self.temporal_adapter_bank.load_state_dict(
+                    adapter_state,
+                    strict=False,
+                )
+                print(f"Adapter missing keys: {len(missing)}")
+                print(f"Adapter unexpected keys: {len(unexpected)}")
+            else:
+                print("WARNING: no temporal_adapter_bank.* keys found.")
+
+            return
+
+        raise FileNotFoundError(
+            f"No temporal_adapter_bank.bin or pytorch_model.bin found in {temporal_model_id}"
+        )
+
+    def print_trainable_parameters(self):
+        total = 0
+        trainable = 0
+
+        for _, param in self.named_parameters():
+            total += param.numel()
+            if param.requires_grad:
+                trainable += param.numel()
+
+        print(
+            f"Trainable parameters: {trainable:,} / {total:,} "
+            f"({100 * trainable / total:.2f}%)"
+        )
 
     def forward(
         self,
@@ -320,15 +338,6 @@ class HistoricalTemporalBertForTokenClassification(nn.Module):
         period_ids=None,
         token_type_ids=None,
     ):
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-
-        if attention_mask is not None and attention_mask.dim() == 1:
-            attention_mask = attention_mask.unsqueeze(0)
-
-        if labels is not None and labels.dim() == 1:
-            labels = labels.unsqueeze(0)
-
         batch_size = input_ids.shape[0]
 
         if period_ids is None:
@@ -338,21 +347,18 @@ class HistoricalTemporalBertForTokenClassification(nn.Module):
                 device=input_ids.device,
             )
 
-        if period_ids.dim() == 0:
-            period_ids = period_ids.unsqueeze(0)
-
         period_ids = period_ids.to(input_ids.device).long()
 
-        bert_outputs = self.temporal_mlm.base.bert(
+        outputs = self.bert(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             return_dict=True,
         )
 
-        sequence_output = bert_outputs.last_hidden_state
+        sequence_output = outputs.last_hidden_state
 
-        sequence_output = self.temporal_mlm.temporal_adapter_bank(
+        sequence_output = self.temporal_adapter_bank(
             hidden_states=sequence_output,
             period_ids=period_ids,
         )
@@ -364,7 +370,6 @@ class HistoricalTemporalBertForTokenClassification(nn.Module):
 
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-
             loss = loss_fct(
                 logits.view(-1, self.num_labels),
                 labels.view(-1),
@@ -431,9 +436,55 @@ def make_compute_metrics(id2label: dict[int, str]):
     return compute_metrics
 
 
-def save_json(path: Path, data: dict) -> None:
+def prediction_report(predictions, label_ids, id2label: dict[int, str]):
+    pred_ids = np.argmax(predictions, axis=-1)
+
+    true_predictions = []
+    true_labels = []
+
+    for pred_seq, label_seq in zip(pred_ids, label_ids):
+        current_preds = []
+        current_labels = []
+
+        for pred_id, label_id in zip(pred_seq, label_seq):
+            if label_id == -100:
+                continue
+
+            current_preds.append(id2label[int(pred_id)])
+            current_labels.append(id2label[int(label_id)])
+
+        true_predictions.append(current_preds)
+        true_labels.append(current_labels)
+
+    metrics = {
+        "precision": precision_score(true_labels, true_predictions),
+        "recall": recall_score(true_labels, true_predictions),
+        "f1": f1_score(true_labels, true_predictions),
+    }
+
+    report = classification_report(true_labels, true_predictions)
+
+    return metrics, report
+
+
+def save_json(path: Path, data: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def str2bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    value = value.lower()
+
+    if value in {"true", "1", "yes", "y"}:
+        return True
+
+    if value in {"false", "0", "no", "n"}:
+        return False
+
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 # ---------------------------------------------------------------------
@@ -442,24 +493,12 @@ def save_json(path: Path, data: dict) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate normal BERT vs temporal BERT on HIPE NER."
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--model_type",
+        "--mode",
         choices=["normal_bert", "temporal_bert"],
         required=True,
-    )
-
-    parser.add_argument("--train_file", required=True)
-    parser.add_argument("--dev_file", required=True)
-    parser.add_argument("--test_file", default=None)
-
-    parser.add_argument(
-        "--label_column",
-        default="NE-COARSE-LIT",
-        help="Examples: NE-COARSE-LIT, NE-COARSE-METO, NE-FINE-LIT.",
     )
 
     parser.add_argument(
@@ -468,66 +507,67 @@ def main():
     )
 
     parser.add_argument(
-        "--temporal_mlm_checkpoint",
+        "--temporal_model_id",
         default=None,
-        help="Local path to trained long-horizon MLM checkpoint.",
+        help="HF repo/path for temporal model. Required for temporal_bert.",
     )
 
-    parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--train_file", required=True)
+    parser.add_argument("--dev_file", required=True)
+    parser.add_argument("--test_file", required=True)
 
+    parser.add_argument("--label_column", default="NE-COARSE-LIT")
+    parser.add_argument("--output_dir", required=True)
+
+    parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--epochs", type=float, default=3.0)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", "--lr", type=float, default=3e-5)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--logging_steps", type=int, default=20)
 
     parser.add_argument("--adapter_bottleneck_size", type=int, default=64)
     parser.add_argument("--adapter_dropout", type=float, default=0.1)
+    parser.add_argument("--freeze_base", type=str2bool, default=False)
 
     parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--push_to_hub", action="store_true")
-    parser.add_argument("--hub_model_id", default=None)
+    parser.add_argument("--token", default=None)
 
     args = parser.parse_args()
 
-    if args.model_type == "temporal_bert" and args.temporal_mlm_checkpoint is None:
-        raise ValueError(
-            "--temporal_mlm_checkpoint is required when --model_type temporal_bert"
-        )
+    if args.mode == "temporal_bert" and args.temporal_model_id is None:
+        raise ValueError("--temporal_model_id is required for temporal_bert")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Reading HIPE files...")
-
     train_examples = read_hipe_tsv(args.train_file, args.label_column)
     dev_examples = read_hipe_tsv(args.dev_file, args.label_column)
-    test_examples = (
-        read_hipe_tsv(args.test_file, args.label_column)
-        if args.test_file is not None
-        else None
-    )
+    test_examples = read_hipe_tsv(args.test_file, args.label_column)
 
-    print(f"Train sentences: {len(train_examples)}")
-    print(f"Dev sentences: {len(dev_examples)}")
-    if test_examples is not None:
-        print(f"Test sentences: {len(test_examples)}")
+    print(f"Train: {len(train_examples)}")
+    print(f"Dev: {len(dev_examples)}")
+    print(f"Test: {len(test_examples)}")
 
     label2id, id2label = build_label_maps(
         train_examples,
         dev_examples,
-        test_examples or [],
+        test_examples,
     )
 
     print("Labels:")
     print(label2id)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        use_fast=True,
+        token=args.token,
+    )
 
-    include_period_ids = args.model_type == "temporal_bert"
+    include_period_ids = args.mode == "temporal_bert"
 
     train_dataset = HipeNERDataset(
         train_examples,
@@ -545,26 +585,24 @@ def main():
         include_period_ids=include_period_ids,
     )
 
-    test_dataset = (
-        HipeNERDataset(
-            test_examples,
-            tokenizer=tokenizer,
-            label2id=label2id,
-            max_length=args.max_length,
-            include_period_ids=include_period_ids,
-        )
-        if test_examples is not None
-        else None
+    test_dataset = HipeNERDataset(
+        test_examples,
+        tokenizer=tokenizer,
+        label2id=label2id,
+        max_length=args.max_length,
+        include_period_ids=include_period_ids,
     )
 
-    if args.model_type == "normal_bert":
-        print("Loading normal BERT for token classification...")
+    if args.mode == "normal_bert":
+        print("Loading normal BERT for NER...")
 
         model = AutoModelForTokenClassification.from_pretrained(
             args.base_model,
             num_labels=len(label2id),
             id2label=id2label,
             label2id=label2id,
+            ignore_mismatched_sizes=True,
+            token=args.token,
         )
 
         collator = DataCollatorForTokenClassification(
@@ -574,39 +612,37 @@ def main():
         )
 
     else:
-        print("Loading temporal BERT for token classification...")
+        print("Loading temporal BERT for NER...")
 
-        model = HistoricalTemporalBertForTokenClassification(
+        model = TemporalBertForTokenClassification(
             base_model=args.base_model,
+            temporal_model_id=args.temporal_model_id,
             num_labels=len(label2id),
             id2label=id2label,
             label2id=label2id,
             adapter_bottleneck_size=args.adapter_bottleneck_size,
             adapter_dropout=args.adapter_dropout,
-            temporal_mlm_checkpoint=args.temporal_mlm_checkpoint,
+            freeze_base=args.freeze_base,
+            token=args.token,
         )
+
+        model.print_trainable_parameters()
 
         collator = TemporalTokenClassificationCollator(tokenizer=tokenizer)
 
     training_args = TrainingArguments(
-        output_dir=args.output_dir,
+        output_dir=str(output_dir),
         eval_strategy="epoch",
-        save_strategy="epoch",
+        save_strategy="no",
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         num_train_epochs=args.epochs,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
-        logging_steps=20,
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="f1",
-        greater_is_better=True,
+        logging_steps=args.logging_steps,
         fp16=torch.cuda.is_available(),
         report_to="none",
-        push_to_hub=args.push_to_hub,
-        hub_model_id=args.hub_model_id,
         remove_unused_columns=False,
         seed=args.seed,
     )
@@ -626,48 +662,26 @@ def main():
 
     print("Evaluating on dev...")
     dev_metrics = trainer.evaluate(dev_dataset)
-    print(dev_metrics)
     save_json(output_dir / "dev_metrics.json", dev_metrics)
+    print(dev_metrics)
 
-    if test_dataset is not None:
-        print("Evaluating on test...")
-        test_metrics = trainer.evaluate(test_dataset)
-        print(test_metrics)
-        save_json(output_dir / "test_metrics.json", test_metrics)
+    print("Evaluating on test...")
+    test_output = trainer.predict(test_dataset)
 
-        print("Saving classification report...")
-        predictions = trainer.predict(test_dataset)
-        pred_ids = np.argmax(predictions.predictions, axis=-1)
+    test_metrics, test_report = prediction_report(
+        predictions=test_output.predictions,
+        label_ids=test_output.label_ids,
+        id2label=id2label,
+    )
 
-        true_predictions = []
-        true_labels = []
+    test_metrics["test_loss"] = float(test_output.metrics.get("test_loss", 0.0))
 
-        for pred_seq, label_seq in zip(pred_ids, predictions.label_ids):
-            current_preds = []
-            current_labels = []
+    save_json(output_dir / "test_metrics.json", test_metrics)
 
-            for pred_id, label_id in zip(pred_seq, label_seq):
-                if label_id == -100:
-                    continue
-
-                current_preds.append(id2label[int(pred_id)])
-                current_labels.append(id2label[int(label_id)])
-
-            true_predictions.append(current_preds)
-            true_labels.append(current_labels)
-
-        report = classification_report(true_labels, true_predictions)
-
-        with open(
-            output_dir / "test_classification_report.txt", "w", encoding="utf-8"
-        ) as f:
-            f.write(report)
-
-        print(report)
-
-    print("Saving model and tokenizer...")
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    with open(
+        output_dir / "test_classification_report.txt", "w", encoding="utf-8"
+    ) as f:
+        f.write(test_report)
 
     with open(output_dir / "labels.json", "w", encoding="utf-8") as f:
         json.dump(
@@ -679,7 +693,13 @@ def main():
             indent=2,
         )
 
-    print(f"Done. Results saved to: {args.output_dir}")
+    tokenizer.save_pretrained(str(output_dir))
+
+    print("Test metrics:")
+    print(test_metrics)
+    print(test_report)
+
+    print(f"Done. Results saved to {output_dir}")
 
 
 if __name__ == "__main__":
