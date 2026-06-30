@@ -1,4 +1,4 @@
-# Smol Historical LLM
+# Historical LLM
 
 <p align="center">
   <img src="assets/smol-historical-llm-logo.png" alt="AI-generated Smol Historical LLM logo" width="200"/>
