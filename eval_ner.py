@@ -486,6 +486,122 @@ def make_compute_metrics(id2label: dict[int, str]):
     return compute_metrics
 
 
+def decode_predictions(predictions, label_ids, id2label: dict[int, str]):
+    pred_ids = np.argmax(predictions, axis=-1)
+
+    true_predictions = []
+    true_labels = []
+
+    for pred_seq, label_seq in zip(pred_ids, label_ids):
+        current_preds = []
+        current_labels = []
+
+        for pred_id, label_id in zip(pred_seq, label_seq):
+            if label_id == -100:
+                continue
+
+            current_preds.append(id2label[int(pred_id)])
+            current_labels.append(id2label[int(label_id)])
+
+        true_predictions.append(current_preds)
+        true_labels.append(current_labels)
+
+    return true_predictions, true_labels
+
+
+def compute_seqeval_metrics(true_labels, true_predictions) -> dict:
+    return {
+        "precision": float(precision_score(true_labels, true_predictions)),
+        "recall": float(recall_score(true_labels, true_predictions)),
+        "f1": float(f1_score(true_labels, true_predictions)),
+        "num_sentences": len(true_labels),
+        "num_entities": int(
+            sum(1 for sent in true_labels for label in sent if label.startswith("B-"))
+        ),
+    }
+
+
+def prediction_report(predictions, label_ids, id2label: dict[int, str]):
+    true_predictions, true_labels = decode_predictions(
+        predictions=predictions,
+        label_ids=label_ids,
+        id2label=id2label,
+    )
+
+    metrics = compute_seqeval_metrics(
+        true_labels=true_labels,
+        true_predictions=true_predictions,
+    )
+
+    report = classification_report(true_labels, true_predictions)
+
+    return metrics, report, true_predictions, true_labels
+
+
+def prediction_report_by_period(
+    examples: list[dict],
+    true_predictions: list[list[str]],
+    true_labels: list[list[str]],
+) -> dict:
+    grouped = {}
+
+    for ex, pred_seq, gold_seq in zip(examples, true_predictions, true_labels):
+        period_id = int(ex.get("period_id", 0))
+
+        if 0 <= period_id < len(PERIODS):
+            period_name = PERIODS[period_id]
+        else:
+            period_name = str(period_id)
+
+        if period_name not in grouped:
+            grouped[period_name] = {
+                "predictions": [],
+                "labels": [],
+            }
+
+        grouped[period_name]["predictions"].append(pred_seq)
+        grouped[period_name]["labels"].append(gold_seq)
+
+    period_metrics = {}
+
+    for period_name, values in grouped.items():
+        labels = values["labels"]
+        predictions = values["predictions"]
+
+        period_metrics[period_name] = compute_seqeval_metrics(
+            true_labels=labels,
+            true_predictions=predictions,
+        )
+
+    return period_metrics
+
+
+def print_period_metrics(period_metrics: dict) -> None:
+    print("\nNER results by temporal period")
+    print("=" * 80)
+    print(
+        f"{'period':<20} "
+        f"{'sentences':>10} "
+        f"{'entities':>10} "
+        f"{'precision':>10} "
+        f"{'recall':>10} "
+        f"{'f1':>10}"
+    )
+    print("-" * 80)
+
+    for period_name, metrics in period_metrics.items():
+        print(
+            f"{period_name:<20} "
+            f"{metrics['num_sentences']:>10} "
+            f"{metrics['num_entities']:>10} "
+            f"{metrics['precision']:>10.4f} "
+            f"{metrics['recall']:>10.4f} "
+            f"{metrics['f1']:>10.4f}"
+        )
+
+    print("=" * 80)
+
+
 def prediction_report(predictions, label_ids, id2label: dict[int, str]):
     pred_ids = np.argmax(predictions, axis=-1)
 
@@ -718,7 +834,7 @@ def main():
     print("Evaluating on test...")
     test_output = trainer.predict(test_dataset)
 
-    test_metrics, test_report = prediction_report(
+    test_metrics, test_report, true_predictions, true_labels = prediction_report(
         predictions=test_output.predictions,
         label_ids=test_output.label_ids,
         id2label=id2label,
@@ -726,7 +842,16 @@ def main():
 
     test_metrics["test_loss"] = float(test_output.metrics.get("test_loss", 0.0))
 
+    period_metrics = prediction_report_by_period(
+        examples=test_examples,
+        true_predictions=true_predictions,
+        true_labels=true_labels,
+    )
+
     save_json(output_dir / "test_metrics.json", test_metrics)
+    save_json(output_dir / "test_metrics_by_period.json", period_metrics)
+
+    print_period_metrics(period_metrics)
 
     with open(
         output_dir / "test_classification_report.txt", "w", encoding="utf-8"
