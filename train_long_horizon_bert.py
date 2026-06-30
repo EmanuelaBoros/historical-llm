@@ -9,12 +9,12 @@ import torch
 from datasets import load_dataset
 from huggingface_hub import HfApi
 from transformers import AutoTokenizer, Trainer, TrainingArguments
-
 from collator_temporal_mlm import TemporalDataCollatorForMLM
 from modeling_temporal_bert import (
     HistoricalTemporalBertForMLM,
     year_to_period_id,
 )
+from modeling_temporal_bert_v2 import HistoricalTemporalBertV2ForMLM
 
 
 @dataclass
@@ -399,12 +399,16 @@ def main() -> None:
     )
 
     print("Loading long-horizon temporal BERT...")
-    model = HistoricalTemporalBertForMLM(
+    model = HistoricalTemporalBertV2ForMLM(
         base_model_name=CFG.base_model,
         adapter_bottleneck_size=CFG.adapter_bottleneck_size,
         adapter_dropout=CFG.adapter_dropout,
         freeze_base=True,
         train_mlm_head=True,
+        use_period_embeddings=True,
+        use_period_classifier=True,
+        period_loss_weight=0.1,
+        unfreeze_last_n_layers=2,
     )
 
     model.print_trainable_parameters()
