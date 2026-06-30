@@ -43,6 +43,28 @@ def parse_year(date_value: str | None) -> int | None:
 
 
 def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
+    """
+    Reads HIPE-style TSV files.
+
+    Expected columns:
+    TOKEN NE-COARSE-LIT NE-COARSE-METO NE-FINE-LIT NE-FINE-METO
+    NE-FINE-COMP NE-NESTED NEL-LIT NEL-METO MISC
+
+    Splits examples on:
+    - blank lines
+    - MISC containing EndOfSentence
+    - new document_id metadata if tokens are already buffered
+
+    Returns one example per sentence/span:
+    {
+        "tokens": [...],
+        "labels": [...],
+        "date": "...",
+        "period_id": int,
+        "document_id": "...",
+    }
+    """
+
     examples = []
 
     current_tokens = []
@@ -51,6 +73,7 @@ def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
     header = None
     token_idx = None
     label_idx = None
+    misc_idx = None
 
     current_date = None
     current_doc_id = None
@@ -58,19 +81,21 @@ def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
     def flush_sentence():
         nonlocal current_tokens, current_labels
 
-        if current_tokens:
-            year = parse_year(current_date)
-            period_id = year_to_period_id(year) if year is not None else 0
+        if not current_tokens:
+            return
 
-            examples.append(
-                {
-                    "tokens": current_tokens,
-                    "labels": current_labels,
-                    "date": current_date,
-                    "period_id": period_id,
-                    "document_id": current_doc_id,
-                }
-            )
+        year = parse_year(current_date)
+        period_id = year_to_period_id(year) if year is not None else 0
+
+        examples.append(
+            {
+                "tokens": current_tokens,
+                "labels": current_labels,
+                "date": current_date,
+                "period_id": period_id,
+                "document_id": current_doc_id,
+            }
+        )
 
         current_tokens = []
         current_labels = []
@@ -79,21 +104,33 @@ def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
         for line in f:
             line = line.rstrip("\n")
 
+            # Blank line = sentence/document boundary
             if not line:
                 flush_sentence()
                 continue
 
+            # Metadata
             if line.startswith("#"):
-                if line.startswith("# hipe2022:date"):
-                    current_date = line.split("=", 1)[1].strip()
-                elif line.startswith("# hipe2022:document_id"):
+                if line.startswith("# hipe2022:document_id"):
+                    # If a new document starts without a blank line, flush previous tokens
+                    flush_sentence()
                     current_doc_id = line.split("=", 1)[1].strip()
+
+                elif line.startswith("# hipe2022:date"):
+                    current_date = line.split("=", 1)[1].strip()
+
                 continue
 
             parts = line.split("\t")
 
+            # Header row
             if parts[0] == "TOKEN":
+                flush_sentence()
+
                 header = parts
+
+                if "TOKEN" not in header:
+                    raise ValueError(f"TOKEN column not found in {path}")
 
                 if label_column not in header:
                     raise ValueError(
@@ -103,6 +140,8 @@ def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
 
                 token_idx = header.index("TOKEN")
                 label_idx = header.index(label_column)
+                misc_idx = header.index("MISC") if "MISC" in header else None
+
                 continue
 
             if header is None:
@@ -120,7 +159,18 @@ def read_hipe_tsv(path: str, label_column: str = "NE-COARSE-LIT") -> list[dict]:
             current_tokens.append(token)
             current_labels.append(label)
 
+            misc_value = (
+                parts[misc_idx]
+                if misc_idx is not None and len(parts) > misc_idx
+                else ""
+            )
+
+            # HIPE sentence boundary
+            if "EndOfSentence" in misc_value:
+                flush_sentence()
+
     flush_sentence()
+
     return examples
 
 
